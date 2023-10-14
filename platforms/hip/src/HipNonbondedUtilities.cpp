@@ -218,7 +218,7 @@ void HipNonbondedUtilities::initialize(const System& system) {
     vector<int2> exclusionTilesVec;
     for (set<pair<int, int> >::const_iterator iter = tilesWithExclusions.begin(); iter != tilesWithExclusions.end(); ++iter)
         exclusionTilesVec.push_back(make_int2(iter->first, iter->second));
-    sort(exclusionTilesVec.begin(), exclusionTilesVec.end(), context.getSIMDWidth() <= 32 || !useCutoff ? compareInt2 : compareInt2LargeSIMD);
+    sort(exclusionTilesVec.begin(), exclusionTilesVec.end(), context.getSIMDWidth() <= 32 || !useNeighborList ? compareInt2 : compareInt2LargeSIMD);
     exclusionTiles.initialize<int2>(context, exclusionTilesVec.size(), "exclusionTiles");
     exclusionTiles.upload(exclusionTilesVec);
     map<pair<int, int>, int> exclusionTileMap;
