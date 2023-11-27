@@ -1,3 +1,5 @@
+#include <hip/hip_fp16.h>
+
 #define BUFFER_SIZE 256
 
 #if defined(AMD_RDNA)
@@ -17,6 +19,21 @@ __device__ inline int warpPopc(warpflags x) {
 }
 
 #endif
+
+struct alignas(sizeof(__half) * 4) BoundingBox {
+    __device__ BoundingBox(real3 f) {
+        // Round up so we'll err on the side of making the box a little too large.
+        // This ensures interactions will never be missed.
+        v[0] = __float2half_ru((float) f.x);
+        v[1] = __float2half_ru((float) f.y);
+        v[2] = __float2half_ru((float) f.z);
+    }
+    __device__ real3 toReal3() const {
+        return make_real3(__half2float(v[0]), __half2float(v[1]), __half2float(v[2]));
+    }
+private:
+    __half v[3];
+};
 
 /**
  * Find a bounding box for the atoms in each block.
@@ -112,13 +129,13 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
  */
 extern "C" __global__ void sortBoxData(const real2* __restrict__ sortedBlock, const real4* __restrict__ blockCenter,
         const real4* __restrict__ blockBoundingBox, real4* __restrict__ sortedBlockCenter,
-        real4* __restrict__ sortedBlockBoundingBox, const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
+        BoundingBox* __restrict__ sortedBlockBoundingBox, const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
         unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
     int i = threadIdx.x+blockIdx.x*blockDim.x;
     if (i < NUM_BLOCKS) {
         int index = (int) sortedBlock[i].y;
         sortedBlockCenter[i] = blockCenter[index];
-        sortedBlockBoundingBox[i] = blockBoundingBox[index];
+        sortedBlockBoundingBox[i] = BoundingBox(trimTo3(blockBoundingBox[index]));
     }
 
     // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
@@ -242,7 +259,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         unsigned int* __restrict__ interactionCount, int* __restrict__ interactingTiles, unsigned int* __restrict__ interactingAtoms,
         int2* __restrict__ singlePairs, const real4* __restrict__ posq, unsigned int maxTiles, unsigned int maxSinglePairs,
         unsigned int startBlockIndex, unsigned int numBlocks, real2* __restrict__ sortedBlocks, const real4* __restrict__ sortedBlockCenter,
-        const real4* __restrict__ sortedBlockBoundingBox, const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
+        const BoundingBox* __restrict__ sortedBlockBoundingBox, const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
         real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
 
     if (rebuildNeighborList[0] == 0)
@@ -276,7 +293,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         real2 sortedKey = sortedBlocks[block1];
         int x = (int) sortedKey.y;
         real4 blockCenterX = sortedBlockCenter[block1];
-        real4 blockSizeX = sortedBlockBoundingBox[block1];
+        real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
         int neighborsInBuffer = 0;
         real4 pos1 = posq[x*TILE_SIZE+indexInTile];
     #ifdef USE_PERIODIC
@@ -329,7 +346,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
             if (!lastIteration && __ballot(includeBlock2) == 0)
                 continue;
     #endif
-            real4 blockSizeY = sortedBlockBoundingBox[block2];
+            real3 blockSizeY = sortedBlockBoundingBox[block2].toReal3();
             blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-blockSizeY.x);
             blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-blockSizeY.y);
             blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-blockSizeY.z);
