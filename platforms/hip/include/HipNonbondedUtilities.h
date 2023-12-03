@@ -340,6 +340,8 @@ private:
     HipArray sortedBlocks;
     HipArray sortedBlockCenter;
     HipArray sortedBlockBoundingBox;
+    HipArray largeBlockCenter;
+    HipArray largeBlockBoundingBox;
     HipArray oldPositions;
     HipArray rebuildNeighborList;
     HipSort* blockSorter;
@@ -353,7 +355,7 @@ private:
     std::map<int, double> groupCutoff;
     std::map<int, std::string> groupKernelSource;
     double lastCutoff;
-    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList;
+    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks;
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;

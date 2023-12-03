@@ -75,6 +75,13 @@ HipNonbondedUtilities::HipNonbondedUtilities(HipContext& context) : context(cont
     numForceThreadBlocks = 5*4*context.getMultiprocessors();
     forceThreadBlockSize = 64;
     findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
+
+    // When building the neighbor list, we can optionally use large blocks (32 * warpSize atoms) to
+    // accelerate the process.  This makes building the neighbor list faster, but it prevents
+    // us from sorting atom blocks by size, which leads to a slightly less efficient neighbor
+    // list.  We guess based on system size which will be faster.
+
+    useLargeBlocks = (context.getNumAtoms() > 90000);
     setKernelSource(HipKernelSources::nonbonded);
 }
 
@@ -284,7 +291,14 @@ void HipNonbondedUtilities::initialize(const System& system) {
             maxTiles = 1;
         maxSinglePairs = 20*numAtoms;
         // HIP-TODO: This may require tuning
-        numTilesInBatch = numAtomBlocks < 2000 ? 4 : 1;
+        if (useLargeBlocks) {
+            // It seems beneficial to launch more thread blocks when large blocks are used.
+            // Hypothesis: when numTilesInBatch warps process one block1, there is a smaller chance
+            // to have a few warps with extremely long durations.
+            numTilesInBatch = 2;
+        } else {
+            numTilesInBatch = numAtomBlocks < 2000 ? 4 : 1;
+        }
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, HipContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
@@ -295,6 +309,8 @@ void HipNonbondedUtilities::initialize(const System& system) {
         sortedBlocks.initialize(context, numAtomBlocks, 2*elementSize, "sortedBlocks");
         sortedBlockCenter.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockCenter");
         sortedBlockBoundingBox.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockBoundingBox");
+        largeBlockCenter.initialize(context, numAtomBlocks, 4*elementSize, "largeBlockCenter");
+        largeBlockBoundingBox.initialize(context, numAtomBlocks*4, elementSize, "largeBlockBoundingBox");
         oldPositions.initialize(context, numAtoms, 4*elementSize, "oldPositions");
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
         blockSorter = new HipSort(context, new BlockSortTrait(context.getUseDoublePrecision()), numAtomBlocks, false);
@@ -350,6 +366,15 @@ void HipNonbondedUtilities::initialize(const System& system) {
         sortBoxDataArgs.push_back(&blockBoundingBox.getDevicePointer());
         sortBoxDataArgs.push_back(&sortedBlockCenter.getDevicePointer());
         sortBoxDataArgs.push_back(&sortedBlockBoundingBox.getDevicePointer());
+        if (useLargeBlocks) {
+            sortBoxDataArgs.push_back(&largeBlockCenter.getDevicePointer());
+            sortBoxDataArgs.push_back(&largeBlockBoundingBox.getDevicePointer());
+            sortBoxDataArgs.push_back(context.getPeriodicBoxSizePointer());
+            sortBoxDataArgs.push_back(context.getInvPeriodicBoxSizePointer());
+            sortBoxDataArgs.push_back(context.getPeriodicBoxVecXPointer());
+            sortBoxDataArgs.push_back(context.getPeriodicBoxVecYPointer());
+            sortBoxDataArgs.push_back(context.getPeriodicBoxVecZPointer());
+        }
         sortBoxDataArgs.push_back(&context.getPosq().getDevicePointer());
         sortBoxDataArgs.push_back(&oldPositions.getDevicePointer());
         sortBoxDataArgs.push_back(&interactionCount.getDevicePointer());
@@ -372,6 +397,10 @@ void HipNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&sortedBlocks.getDevicePointer());
         findInteractingBlocksArgs.push_back(&sortedBlockCenter.getDevicePointer());
         findInteractingBlocksArgs.push_back(&sortedBlockBoundingBox.getDevicePointer());
+        if (useLargeBlocks) {
+            findInteractingBlocksArgs.push_back(&largeBlockCenter.getDevicePointer());
+            findInteractingBlocksArgs.push_back(&largeBlockBoundingBox.getDevicePointer());
+        }
         findInteractingBlocksArgs.push_back(&exclusionIndices.getDevicePointer());
         findInteractingBlocksArgs.push_back(&exclusionRowIndices.getDevicePointer());
         findInteractingBlocksArgs.push_back(&oldPositions.getDevicePointer());
@@ -416,7 +445,8 @@ void HipNonbondedUtilities::prepareInteractions(int forceGroups) {
     if (lastCutoff != kernels.cutoffDistance)
         forceRebuildNeighborList = true;
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
-    blockSorter->sort(sortedBlocks);
+    if (!useLargeBlocks)
+        blockSorter->sort(sortedBlocks);
     context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
     context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     forceRebuildNeighborList = false;
@@ -524,6 +554,8 @@ void HipNonbondedUtilities::createKernelsForGroups(int groups) {
             defines["USE_PERIODIC"] = "1";
         if (context.getBoxIsTriclinic())
             defines["TRICLINIC"] = "1";
+        if (useLargeBlocks)
+            defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
         int maxBits = 0;
         if (canUsePairList) {

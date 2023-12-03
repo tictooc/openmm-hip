@@ -128,14 +128,37 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
  * Sort the data about bounding boxes so it can be accessed more efficiently in the next kernel.
  */
 extern "C" __global__ void sortBoxData(const real2* __restrict__ sortedBlock, const real4* __restrict__ blockCenter,
-        const real4* __restrict__ blockBoundingBox, real4* __restrict__ sortedBlockCenter,
-        BoundingBox* __restrict__ sortedBlockBoundingBox, const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
+        const real4* __restrict__ blockBoundingBox, real4* __restrict__ sortedBlockCenter, BoundingBox* __restrict__ sortedBlockBoundingBox,
+#ifdef USE_LARGE_BLOCKS
+        real4* __restrict__ largeBlockCenter, BoundingBox* __restrict__ largeBlockBoundingBox, real4 periodicBoxSize,
+        real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+#endif
+        const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
         unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
     int i = threadIdx.x+blockIdx.x*blockDim.x;
     if (i < NUM_BLOCKS) {
         int index = (int) sortedBlock[i].y;
         sortedBlockCenter[i] = blockCenter[index];
         sortedBlockBoundingBox[i] = BoundingBox(trimTo3(blockBoundingBox[index]));
+#ifdef USE_LARGE_BLOCKS
+        // Compute the sizes of large blocks (composed of warpSize regular blocks) starting from each block.
+
+        real4 minPos = blockCenter[i]-blockBoundingBox[i];
+        real4 maxPos = blockCenter[i]+blockBoundingBox[i];
+        int last = min(i+warpSize, NUM_BLOCKS);
+        for (int j = i+1; j < last; j++) {
+            real4 blockPos = blockCenter[j];
+            real4 width = blockBoundingBox[j];
+#ifdef USE_PERIODIC
+            real4 center = 0.5f*(maxPos+minPos);
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(blockPos, center)
+#endif
+            minPos = make_real4(min(minPos.x, blockPos.x-width.x), min(minPos.y, blockPos.y-width.y), min(minPos.z, blockPos.z-width.z), 0);
+            maxPos = make_real4(max(maxPos.x, blockPos.x+width.x), max(maxPos.y, blockPos.y+width.y), max(maxPos.z, blockPos.z+width.z), 0);
+        }
+        largeBlockCenter[i] = 0.5f*(maxPos+minPos);
+        largeBlockBoundingBox[i] = BoundingBox(trimTo3(0.5f*(maxPos-minPos)));
+#endif
     }
 
     // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
@@ -258,8 +281,12 @@ void mfma4x4(const float4& pos1, const float4& pos2, const vfloat& c, unsigned i
 extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         unsigned int* __restrict__ interactionCount, int* __restrict__ interactingTiles, unsigned int* __restrict__ interactingAtoms,
         int2* __restrict__ singlePairs, const real4* __restrict__ posq, unsigned int maxTiles, unsigned int maxSinglePairs,
-        unsigned int startBlockIndex, unsigned int numBlocks, real2* __restrict__ sortedBlocks, const real4* __restrict__ sortedBlockCenter,
-        const BoundingBox* __restrict__ sortedBlockBoundingBox, const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
+        unsigned int startBlockIndex, unsigned int numBlocks, const real2* __restrict__ sortedBlocks, const real4* __restrict__ sortedBlockCenter,
+        const BoundingBox* __restrict__ sortedBlockBoundingBox,
+#ifdef USE_LARGE_BLOCKS
+        const real4* __restrict__ largeBlockCenter, const BoundingBox* __restrict__ largeBlockBoundingBox,
+#endif
+        const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
         real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
 
     if (rebuildNeighborList[0] == 0)
@@ -328,10 +355,45 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         // units are idle at the end of the kernel (the kernel works on the upper triangle of
         // the NUM_BLOCKS x NUM_BLOCKS matrix).
 
+#ifdef USE_LARGE_BLOCKS
+        warpflags largeBlockFlags = 0;
+        int loadedLargeBlocks = 0;
+#endif
         int block2Count = 0;
         // Load blocks from addresses aligned by warpSize for faster loading from sortedBlockCenter and sortedBlockBoundingBox.
         for (int block2Base = ((block1+1)/warpSize + warpIndex%NUM_TILES_IN_BATCH)*warpSize; block2Base < NUM_BLOCKS; block2Base += warpSize*NUM_TILES_IN_BATCH) {
+            // Last iteration cannot be skipped (on CDNA where tilesPerWarp == 2)
             const bool lastIteration = block2Base + warpSize*NUM_TILES_IN_BATCH >= NUM_BLOCKS;
+#ifdef USE_LARGE_BLOCKS
+            if (loadedLargeBlocks == 0) {
+                // Check the next set of large blocks.
+
+                int largeBlockIndex = block2Base + warpSize*NUM_TILES_IN_BATCH*indexInWarp;
+                bool includeLargeBlock = false;
+                if (largeBlockIndex < NUM_BLOCKS) {
+                    real4 largeCenter = largeBlockCenter[largeBlockIndex];
+                    real3 largeSize = largeBlockBoundingBox[largeBlockIndex].toReal3();
+                    real4 blockDelta = blockCenterX-largeCenter;
+#ifdef USE_PERIODIC
+                    APPLY_PERIODIC_TO_DELTA(blockDelta)
+#endif
+                    blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-largeSize.x);
+                    blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-largeSize.y);
+                    blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-largeSize.z);
+                    includeLargeBlock = (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED);
+                }
+                largeBlockFlags = __ballot(includeLargeBlock);
+                loadedLargeBlocks = warpSize;
+            }
+            loadedLargeBlocks--;
+            if ((largeBlockFlags&1) == 0 && !lastIteration) {
+                // None of the next warpSize blocks interact with block 1.
+
+                largeBlockFlags >>= 1;
+                continue;
+            }
+            largeBlockFlags >>= 1;
+#endif
             int block2 = block2Base+indexInWarp;
             bool includeBlock2 = (block1 < block2 && block2 < NUM_BLOCKS);
             block2 = includeBlock2 ? block2 : block1;
