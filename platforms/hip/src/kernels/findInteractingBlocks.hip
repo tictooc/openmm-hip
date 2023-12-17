@@ -40,7 +40,7 @@ private:
  */
 extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
-        real2* __restrict__ sortedBlocks) {
+        real2* __restrict__ blockSizeRange) {
     const int indexInTile = threadIdx.x%TILE_SIZE;
     const int index = warpSize == TILE_SIZE ? blockIdx.x : (blockIdx.x*(warpSize/TILE_SIZE) + threadIdx.x/TILE_SIZE);
     const int base = index * TILE_SIZE;
@@ -114,41 +114,61 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         center.w = SQRT(tcenter);
         blockBoundingBox[index] = blockSize;
         blockCenter[index] = center;
-        // blockSize.x+blockSize.y+blockSize.z has a distibution that looks like a normal distribution.
-        // This causes HipSort's buckets to have very non-uniform sizes, so a few very long buckets are
-        // sorted in global memory. -1/max(x, y, z) or -1/(x+y+z) have a "faster" distribution.
-        sortedBlocks[index] = make_real2(-RECIP(max(max(blockSize.x, blockSize.y), blockSize.z)), index);
+
+        // Record the range of sizes.
+        real totalSize = blockSize.x+blockSize.y+blockSize.z;
+        atomicMin(&blockSizeRange->x, totalSize);
+        atomicMax(&blockSizeRange->y, totalSize);
     }
     if (blockIdx.x == 0 && threadIdx.x == 0)
         rebuildNeighborList[0] = 0;
 }
 
+extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks, const real2* __restrict__ blockSizeRange/*, int numSizes*/) {
+    // Sort keys store the bin in the high order part and the block in the low
+    // order part.
+
+    real2 sizeRange = make_real2(LOG(blockSizeRange->x), LOG(blockSizeRange->y));
+    int numSizeBins = 20;
+    real scale = numSizeBins/(sizeRange.y-sizeRange.x);
+    unsigned int i = threadIdx.x+blockIdx.x*blockDim.x;
+    if (i < NUM_BLOCKS) {
+        real4 box = blockBoundingBox[i];
+        real size = LOG(box.x+box.y+box.z);
+        int bin = (size-sizeRange.x)*scale;
+        bin = max(0, min(bin, numSizeBins-1));
+        sortedBlocks[i] = (((unsigned int) bin)<<BIN_SHIFT) + i;
+    }
+}
 
 /**
  * Sort the data about bounding boxes so it can be accessed more efficiently in the next kernel.
  */
-extern "C" __global__ void sortBoxData(const real2* __restrict__ sortedBlock, const real4* __restrict__ blockCenter,
+extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBlocks, const real4* __restrict__ blockCenter,
         const real4* __restrict__ blockBoundingBox, real4* __restrict__ sortedBlockCenter, BoundingBox* __restrict__ sortedBlockBoundingBox,
 #ifdef USE_LARGE_BLOCKS
         real4* __restrict__ largeBlockCenter, BoundingBox* __restrict__ largeBlockBoundingBox, real4 periodicBoxSize,
         real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
 #endif
         const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
-        unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
+        unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild,
+        real2* __restrict__ blockSizeRange) {
     int i = threadIdx.x+blockIdx.x*blockDim.x;
     if (i < NUM_BLOCKS) {
-        int index = (int) sortedBlock[i].y;
+        unsigned int index = sortedBlocks[i] & BLOCK_INDEX_MASK;
         sortedBlockCenter[i] = blockCenter[index];
         sortedBlockBoundingBox[i] = BoundingBox(trimTo3(blockBoundingBox[index]));
+
 #ifdef USE_LARGE_BLOCKS
         // Compute the sizes of large blocks (composed of warpSize regular blocks) starting from each block.
 
-        real4 minPos = blockCenter[i]-blockBoundingBox[i];
-        real4 maxPos = blockCenter[i]+blockBoundingBox[i];
+        real4 minPos = blockCenter[index]-blockBoundingBox[index];
+        real4 maxPos = blockCenter[index]+blockBoundingBox[index];
         int last = min(i+warpSize, NUM_BLOCKS);
         for (int j = i+1; j < last; j++) {
-            real4 blockPos = blockCenter[j];
-            real4 width = blockBoundingBox[j];
+            unsigned int index2 = sortedBlocks[j] & BLOCK_INDEX_MASK;
+            real4 blockPos = blockCenter[index2];
+            real4 width = blockBoundingBox[index2];
 #ifdef USE_PERIODIC
             real4 center = 0.5f*(maxPos+minPos);
             APPLY_PERIODIC_TO_POS_WITH_CENTER(blockPos, center)
@@ -159,6 +179,12 @@ extern "C" __global__ void sortBoxData(const real2* __restrict__ sortedBlock, co
         largeBlockCenter[i] = 0.5f*(maxPos+minPos);
         largeBlockBoundingBox[i] = BoundingBox(trimTo3(0.5f*(maxPos-minPos)));
 #endif
+    }
+
+    // Initialize min and max for the atomic reduction in findBlockBounds (for the next step)
+    if (i == 0) {
+        blockSizeRange->x = 1e38;
+        blockSizeRange->y = 0;
     }
 
     // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
@@ -281,7 +307,7 @@ void mfma4x4(const float4& pos1, const float4& pos2, const vfloat& c, unsigned i
 extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         unsigned int* __restrict__ interactionCount, int* __restrict__ interactingTiles, unsigned int* __restrict__ interactingAtoms,
         int2* __restrict__ singlePairs, const real4* __restrict__ posq, unsigned int maxTiles, unsigned int maxSinglePairs,
-        unsigned int startBlockIndex, unsigned int numBlocks, const real2* __restrict__ sortedBlocks, const real4* __restrict__ sortedBlockCenter,
+        unsigned int startBlockIndex, unsigned int numBlocks, const unsigned int* __restrict__ sortedBlocks, const real4* __restrict__ sortedBlockCenter,
         const BoundingBox* __restrict__ sortedBlockBoundingBox,
 #ifdef USE_LARGE_BLOCKS
         const real4* __restrict__ largeBlockCenter, const BoundingBox* __restrict__ largeBlockBoundingBox,
@@ -317,8 +343,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
     if (block1 < startBlockIndex+numBlocks) {
         // Load data for this block.  Note that all threads in a warp are processing the same block.
 
-        real2 sortedKey = sortedBlocks[block1];
-        int x = (int) sortedKey.y;
+        int x = sortedBlocks[block1] & BLOCK_INDEX_MASK;
         real4 blockCenterX = sortedBlockCenter[block1];
         real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
         int neighborsInBuffer = 0;
@@ -381,6 +406,13 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                     blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-largeSize.y);
                     blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-largeSize.z);
                     includeLargeBlock = (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED);
+#ifdef TRICLINIC
+                    // The calculation to find the nearest periodic copy is only guaranteed to work if the nearest copy is less than half a box width away.
+                    // If there's any possibility we might have missed it, do a detailed check.
+
+                    if (periodicBoxSize.z/2-blockSizeX.z-largeSize.z < PADDED_CUTOFF || periodicBoxSize.y/2-blockSizeX.y-largeSize.y < PADDED_CUTOFF)
+                        includeLargeBlock = true;
+#endif
                 }
                 largeBlockFlags = __ballot(includeLargeBlock);
                 loadedLargeBlocks = warpSize;
@@ -440,7 +472,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 const int b = block2Buffer[min(block2Index + tileInWarp, block2Count - 1)];
                 const bool forceInclude = b & 1;
                 const int block2 = b >> 1;
-                int y = (int) sortedBlocks[block2].y;
+                int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
 
                 #pragma unroll 1
                 for (int k = indexInTile; k < numExclusions; k += TILE_SIZE)

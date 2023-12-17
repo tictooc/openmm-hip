@@ -6,7 +6,7 @@
  * Biological Structures at Stanford, funded under the NIH Roadmap for        *
  * Medical Research, grant U54 GM072970. See https://simtk.org.               *
  *                                                                            *
- * Portions copyright (c) 2009-2022 Stanford University and the Authors.      *
+ * Portions copyright (c) 2009-2023 Stanford University and the Authors.      *
  * Portions copyright (C) 2020-2023 Advanced Micro Devices, Inc. All Rights   *
  * Reserved.                                                                  *
  * Authors: Peter Eastman, Nicholas Curtis                                    *
@@ -51,18 +51,15 @@ using namespace std;
 
 class HipNonbondedUtilities::BlockSortTrait : public HipSort::SortTrait {
 public:
-    BlockSortTrait(bool useDouble) : useDouble(useDouble) {
-    }
-    int getDataSize() const {return useDouble ? sizeof(double2) : sizeof(float2);}
-    int getKeySize() const {return useDouble ? sizeof(double) : sizeof(float);}
-    const char* getDataType() const {return "real2";}
-    const char* getKeyType() const {return "real";}
-    const char* getMinKey() const {return "-3.40282e+38f";}
-    const char* getMaxKey() const {return "3.40282e+38f";}
-    const char* getMaxValue() const {return "make_real2(3.40282e+38f, 3.40282e+38f)";}
-    const char* getSortKey() const {return "value.x";}
-private:
-    bool useDouble;
+    BlockSortTrait() {}
+    int getDataSize() const {return sizeof(int);}
+    int getKeySize() const {return sizeof(int);}
+    const char* getDataType() const {return "unsigned int";}
+    const char* getKeyType() const {return "unsigned int";}
+    const char* getMinKey() const {return "0";}
+    const char* getMaxKey() const {return "0xFFFFFFFFu";}
+    const char* getMaxValue() const {return "0xFFFFFFFFu";}
+    const char* getSortKey() const {return "value";}
 };
 
 HipNonbondedUtilities::HipNonbondedUtilities(HipContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
@@ -291,14 +288,7 @@ void HipNonbondedUtilities::initialize(const System& system) {
             maxTiles = 1;
         maxSinglePairs = 20*numAtoms;
         // HIP-TODO: This may require tuning
-        if (useLargeBlocks) {
-            // It seems beneficial to launch more thread blocks when large blocks are used.
-            // Hypothesis: when numTilesInBatch warps process one block1, there is a smaller chance
-            // to have a few warps with extremely long durations.
-            numTilesInBatch = 2;
-        } else {
-            numTilesInBatch = numAtomBlocks < 2000 ? 4 : 1;
-        }
+        numTilesInBatch = numAtomBlocks < 2000 ? 4 : 1;
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, HipContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
@@ -306,17 +296,23 @@ void HipNonbondedUtilities::initialize(const System& system) {
         int elementSize = (context.getUseDoublePrecision() ? sizeof(double) : sizeof(float));
         blockCenter.initialize(context, numAtomBlocks, 4*elementSize, "blockCenter");
         blockBoundingBox.initialize(context, numAtomBlocks, 4*elementSize, "blockBoundingBox");
-        sortedBlocks.initialize(context, numAtomBlocks, 2*elementSize, "sortedBlocks");
+        sortedBlocks.initialize<unsigned int>(context, numAtomBlocks, "sortedBlocks");
         sortedBlockCenter.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockCenter");
         sortedBlockBoundingBox.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockBoundingBox");
+        blockSizeRange.initialize(context, 2, elementSize, "blockSizeRange");
         largeBlockCenter.initialize(context, numAtomBlocks, 4*elementSize, "largeBlockCenter");
         largeBlockBoundingBox.initialize(context, numAtomBlocks*4, elementSize, "largeBlockBoundingBox");
         oldPositions.initialize(context, numAtoms, 4*elementSize, "oldPositions");
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
-        blockSorter = new HipSort(context, new BlockSortTrait(context.getUseDoublePrecision()), numAtomBlocks, false);
+        blockSorter = new HipSort(context, new BlockSortTrait(), numAtomBlocks, false);
         vector<unsigned int> count(2, 0);
         interactionCount.upload(count);
         rebuildNeighborList.upload(&count[0]);
+        if (context.getUseDoublePrecision()) {
+            blockSizeRange.upload(vector<double>{1e38, 0});
+        } else {
+            blockSizeRange.upload(vector<float>{1e38, 0});
+        }
     }
 
     // Record arguments for kernels.
@@ -360,7 +356,10 @@ void HipNonbondedUtilities::initialize(const System& system) {
         findBlockBoundsArgs.push_back(&blockCenter.getDevicePointer());
         findBlockBoundsArgs.push_back(&blockBoundingBox.getDevicePointer());
         findBlockBoundsArgs.push_back(&rebuildNeighborList.getDevicePointer());
-        findBlockBoundsArgs.push_back(&sortedBlocks.getDevicePointer());
+        findBlockBoundsArgs.push_back(&blockSizeRange.getDevicePointer());
+        computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
+        computeSortKeysArgs.push_back(&sortedBlocks.getDevicePointer());
+        computeSortKeysArgs.push_back(&blockSizeRange.getDevicePointer());
         sortBoxDataArgs.push_back(&sortedBlocks.getDevicePointer());
         sortBoxDataArgs.push_back(&blockCenter.getDevicePointer());
         sortBoxDataArgs.push_back(&blockBoundingBox.getDevicePointer());
@@ -380,6 +379,7 @@ void HipNonbondedUtilities::initialize(const System& system) {
         sortBoxDataArgs.push_back(&interactionCount.getDevicePointer());
         sortBoxDataArgs.push_back(&rebuildNeighborList.getDevicePointer());
         sortBoxDataArgs.push_back(&forceRebuildNeighborList);
+        sortBoxDataArgs.push_back(&blockSizeRange.getDevicePointer());
         findInteractingBlocksArgs.push_back(context.getPeriodicBoxSizePointer());
         findInteractingBlocksArgs.push_back(context.getInvPeriodicBoxSizePointer());
         findInteractingBlocksArgs.push_back(context.getPeriodicBoxVecXPointer());
@@ -445,8 +445,8 @@ void HipNonbondedUtilities::prepareInteractions(int forceGroups) {
     if (lastCutoff != kernels.cutoffDistance)
         forceRebuildNeighborList = true;
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
-    if (!useLargeBlocks)
-        blockSorter->sort(sortedBlocks);
+    context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
+    blockSorter->sort(sortedBlocks);
     context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
     context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     forceRebuildNeighborList = false;
@@ -584,8 +584,14 @@ void HipNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(maxBits);
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
+        int binShift = 1;
+        while (1<<binShift <= context.getNumAtomBlocks())
+            binShift++;
+        defines["BIN_SHIFT"] = context.intToString(binShift);
+        defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         hipModule_t interactingBlocksProgram = context.createModule(HipKernelSources::vectorOps+HipKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
+        kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");
         kernels.copyInteractionCountsKernel = context.getKernel(interactingBlocksProgram, "copyInteractionCounts");

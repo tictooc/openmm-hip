@@ -9,7 +9,7 @@
  * Biological Structures at Stanford, funded under the NIH Roadmap for        *
  * Medical Research, grant U54 GM072970. See https://simtk.org.               *
  *                                                                            *
- * Portions copyright (c) 2009-2022 Stanford University and the Authors.      *
+ * Portions copyright (c) 2009-2023 Stanford University and the Authors.      *
  * Portions copyright (C) 2020-2023 Advanced Micro Devices, Inc. All Rights   *
  * Reserved.                                                                  *
  * Authors: Peter Eastman, Nicholas Curtis                                    *
@@ -340,6 +340,7 @@ private:
     HipArray sortedBlocks;
     HipArray sortedBlockCenter;
     HipArray sortedBlockBoundingBox;
+    HipArray blockSizeRange;
     HipArray largeBlockCenter;
     HipArray largeBlockBoundingBox;
     HipArray oldPositions;
@@ -347,7 +348,7 @@ private:
     HipSort* blockSorter;
     hipEvent_t downloadCountEvent;
     unsigned int* pinnedCountBuffer;
-    std::vector<void*> forceArgs, findBlockBoundsArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
+    std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ParameterInfo> parameters;
     std::vector<ParameterInfo> arguments;
@@ -374,6 +375,7 @@ public:
     std::string source;
     hipFunction_t forceKernel, energyKernel, forceEnergyKernel;
     hipFunction_t findBlockBoundsKernel;
+    hipFunction_t computeSortKeysKernel;
     hipFunction_t sortBoxDataKernel;
     hipFunction_t findInteractingBlocksKernel;
     hipFunction_t copyInteractionCountsKernel;
