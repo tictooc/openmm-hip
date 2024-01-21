@@ -489,7 +489,7 @@ string HipContext::getHash(const string& src) const {
 
 string HipContext::getCacheFileName(const string& src) const {
     stringstream cacheFile;
-    cacheFile << cacheDir << getHash(src) << '_' << gpuArchitecture;
+    cacheFile << cacheDir << "openmm-hip-" << getHash(src + gpuArchitecture);
     return cacheFile.str();
 }
 
@@ -500,7 +500,7 @@ hipModule_t HipContext::createModule(const string source) {
 hipModule_t HipContext::createModule(const string source, const map<string, string>& defines) {
     const char* saveTempsEnv = getenv("OPENMM_SAVE_TEMPS");
     bool saveTemps = saveTempsEnv != nullptr;
-    string options = "-ffast-math -munsafe-fp-atomics -Wall";
+    string options = "-O3 -ffast-math -munsafe-fp-atomics -Wall";
     // HIP-TODO: Remove it when the compiler does a better job
     // Disable SLP vectorization as it may generate unoptimal packed math instructions on >=MI200
     // (gfx90a): more v_mov, higher register usage etc.
@@ -594,35 +594,29 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
     else {
         tempFileName << getTempFileName();
     }
-    string inputFile = (tempFileName.str()+".hip.cpp");
-    string outputFile = (tempFileName.str()+".hsaco");
+    string inputFile = (tempFileName.str()+".hip");
+    string outputFile = (tempFileName.str()+".code");
     string logFile = (tempFileName.str()+".log");
     int res = 0;
 
     // If the runtime compiler plugin is available, use it.
 
     if (hasCompilerKernel) {
-        vector<char> ptx = compilerKernel.getAs<HipCompilerKernel>().createModule(src.str(), options, *this);
+        vector<char> code = compilerKernel.getAs<HipCompilerKernel>().createModule(src.str(), options, *this);
         // If possible, write the PTX out to a temporary file so we can cache it for later use.
 
-        bool wroteCache = false;
         try {
-            ofstream out(outputFile.c_str(), ios::out | ios::binary);
-            out.write(&ptx[0], ptx.size());
+            ofstream out(cacheFile.c_str(), ios::out | ios::binary);
+            out.write(&code[0], code.size());
             out.close();
-            if (!out.fail())
-                wroteCache = true;
         }
         catch (...) {
+            // An error occurred.  Possibly we don't have permission to write to the temp directory.
             // Ignore.
         }
-        if (!wroteCache) {
-            // An error occurred.  Possibly we don't have permission to write to the temp directory.  Just try to load the module directly.
-
-            CHECK_RESULT2(hipModuleLoadDataEx(&module, &ptx[0], 0, NULL, NULL), "Error loading HIP module");
-            loadedModules.push_back(module);
-            return module;
-        }
+        CHECK_RESULT2(hipModuleLoadDataEx(&module, &code[0], 0, NULL, NULL), "Error loading HIP module");
+        loadedModules.push_back(module);
+        return module;
     }
     else {
         // Write out the source to a temporary file.
@@ -630,48 +624,55 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
         ofstream out(inputFile.c_str());
         out << src.str();
         out.close();
-        string command = compiler + " --genco --offload-arch=" + gpuArchitecture + " " + options + (saveTemps ? " -save-temps=obj" : "") +" -o \""+outputFile+"\" " + " \""+inputFile+"\" 2> \""+logFile+"\"";
+        string command = compiler + " -x hip --offload-device-only --offload-arch=" + gpuArchitecture + " " + options + (saveTemps ? " -save-temps=obj" : "") +" -o \""+outputFile+"\" " + " \""+inputFile+"\" 2> \""+logFile+"\"";
         res = std::system(command.c_str());
-    }
-    try {
-        if (res != 0) {
-            // Load the error log.
+        try {
+            if (res != 0) {
+                // Load the error log.
 
-            stringstream error;
-            error << "Error launching HIP compiler: " << res;
-            ifstream log(logFile.c_str());
-            if (log.is_open()) {
-                string line;
-                while (!log.eof()) {
-                    getline(log, line);
-                    error << '\n' << line;
+                stringstream error;
+                error << "Error launching HIP compiler: " << res;
+                ifstream log(logFile.c_str());
+                if (log.is_open()) {
+                    string line;
+                    while (!log.eof()) {
+                        getline(log, line);
+                        error << '\n' << line;
+                    }
+                    log.close();
                 }
-                log.close();
+                throw OpenMMException(error.str());
             }
-            throw OpenMMException(error.str());
+
+            vector<char> code;
+            ifstream out(outputFile.c_str(), ios::in | ios::binary);
+            if (!out.is_open()) {
+                std::stringstream error;
+                error << "Error reading HIP module from `" << outputFile << "`";
+                throw OpenMMException(error.str());
+            }
+            code.insert(code.begin(), istreambuf_iterator<char>(out), istreambuf_iterator<char>());
+            out.close();
+
+            if (!saveTemps) {
+                remove(inputFile.c_str());
+                remove(logFile.c_str());
+            }
+            if (rename(outputFile.c_str(), cacheFile.c_str()) != 0 && !saveTemps)
+                remove(outputFile.c_str());
+
+            CHECK_RESULT2(hipModuleLoadDataEx(&module, &code[0], 0, NULL, NULL), "Error loading HIP module");
+            loadedModules.push_back(module);
+            return module;
         }
-        hipError_t result = hipModuleLoad(&module, outputFile.c_str());
-        if (result != hipSuccess) {
-            std::stringstream m;
-            m<<"Error loading HIP module: "<<getErrorString(result)<<" ("<<result<<")";
-            throw OpenMMException(m.str());
+        catch (...) {
+            if (!saveTemps) {
+                remove(inputFile.c_str());
+                remove(outputFile.c_str());
+                remove(logFile.c_str());
+            }
+            throw;
         }
-        if (!saveTemps) {
-            remove(inputFile.c_str());
-            remove(logFile.c_str());
-        }
-        if (rename(outputFile.c_str(), cacheFile.c_str()) != 0 && !saveTemps)
-            remove(outputFile.c_str());
-        loadedModules.push_back(module);
-        return module;
-    }
-    catch (...) {
-        if (!saveTemps) {
-            remove(inputFile.c_str());
-            remove(outputFile.c_str());
-            remove(logFile.c_str());
-        }
-        throw;
     }
 }
 
