@@ -904,24 +904,20 @@ vector<int> HipContext::getDevicePrecedence() {
     int numDevices;
     hipDeviceProp_t thisDevice;
     string errorMessage = "Error initializing Context";
-    vector<pair<pair<int, int>, int> > devices;
+    vector<pair<int, int> > devices;
 
     CHECK_RESULT(hipGetDeviceCount(&numDevices));
     for (int i = 0; i < numDevices; i++) {
         CHECK_RESULT(hipGetDeviceProperties(&thisDevice, i));
         int clock, multiprocessors, speed;
         // AMD GPU
-        // gcn arch is available if needed, however...
-        int major = thisDevice.gcnArch;
         clock = thisDevice.clockRate;
         multiprocessors = thisDevice.multiProcessorCount;
         speed = clock*multiprocessors;
-        pair<int, int> deviceProperties = std::make_pair(major, speed);
-        devices.push_back(std::make_pair(deviceProperties, -i));
+        devices.push_back(std::make_pair(speed, -i));
     }
 
-    // sort first by compute capability (higher is better), then speed
-    // (higher is better), and finally device index (lower is better)
+    // sort first by speed (higher is better), and finally device index (lower is better)
     std::sort(devices.begin(), devices.end());
     std::reverse(devices.begin(), devices.end());
 
