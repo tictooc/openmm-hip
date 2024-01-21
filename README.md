@@ -11,6 +11,9 @@ This plugin requires hipFFT and rocFFT, install them from ROCm repositories:
 apt install hipfft rocfft
 ```
 
+If you see "libhipfft.so.0: cannot open shared object file: No such file or directory", run
+`ldconfig`.
+
 ```sh
 conda create -n openmm-env -c streamhpc -c conda-forge --strict-channel-priority openmm-hip
 conda activate openmm-env
@@ -69,7 +72,7 @@ The plugin requires source code of OpenMM, it can be downloaded as an archive
 [here](https://github.com/openmm/openmm/releases) or as a Git repository:
 
 ```sh
-git clone https://github.com/openmm/openmm.git -b 8.0.0
+git clone https://github.com/openmm/openmm.git -b 8.1.1
 ```
 
 To build the plugin, follow these steps:
@@ -100,7 +103,7 @@ source code:
 ```sh
 mkdir build build-hip install
 
-git clone https://github.com/openmm/openmm.git -b 8.0.0
+git clone https://github.com/openmm/openmm.git -b 8.1.1
 cd build
 cmake ../openmm/ -D CMAKE_INSTALL_PREFIX=../install -D OPENMM_BUILD_COMMON=ON -D OPENMM_PYTHON_USER_INSTALL=ON
 make
