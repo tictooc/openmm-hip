@@ -93,6 +93,7 @@ HipPlatform::HipPlatform() {
     registerKernelFactory(CalcCustomHbondForceKernel::Name(), factory);
     registerKernelFactory(CalcCustomCentroidBondForceKernel::Name(), factory);
     registerKernelFactory(CalcCustomCompoundBondForceKernel::Name(), factory);
+    registerKernelFactory(CalcCustomCPPForceKernel::Name(), factory);
     registerKernelFactory(CalcCustomCVForceKernel::Name(), factory);
     registerKernelFactory(CalcRMSDForceKernel::Name(), factory);
     registerKernelFactory(CalcCustomManyParticleForceKernel::Name(), factory);
@@ -108,6 +109,7 @@ HipPlatform::HipPlatform() {
     registerKernelFactory(ApplyAndersenThermostatKernel::Name(), factory);
     registerKernelFactory(ApplyMonteCarloBarostatKernel::Name(), factory);
     registerKernelFactory(RemoveCMMotionKernel::Name(), factory);
+    registerKernelFactory(CalcATMForceKernel::Name(), factory);
     platformProperties.push_back(HipDeviceIndex());
     platformProperties.push_back(HipDeviceName());
     platformProperties.push_back(HipUseBlockingSync());
@@ -133,16 +135,12 @@ HipPlatform::HipPlatform() {
         hipcc = compiler;
     }
     else if (rocmPath != NULL) {
-        hipcc = string(rocmPath) + "/bin/hipcc";
+        hipcc = string(rocmPath) + "/bin/amdclang++";
     }
     else {
-        hipcc = "/opt/rocm/bin/hipcc";
+        hipcc = "/opt/rocm/bin/amdclang++";
     }
     setPropertyDefaultValue(HipCompiler(), hipcc);
-    // Do not use hipRTC by default (it doesn't allow to use a workaround for DPP, see comments in
-    // HipContext::createModule and intrinsics.hip so performance may be a bit lower).
-    // HIP-TODO: Enable when the compiler issue is fixed.
-    // hipRTC on ROCm before 4.3 and earlier has issues so it's not supported
     char* useHipRtcEnv = getenv("OPENMM_USE_HIPRTC");
     bool allowRuntimeCompiler = (useHipRtcEnv != NULL && string(useHipRtcEnv) == "1");
     setPropertyDefaultValue(HipAllowRuntimeCompiler(), allowRuntimeCompiler ? "true" : "false");
